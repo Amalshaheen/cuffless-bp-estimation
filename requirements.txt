@@ -1,0 +1,23 @@
+# Data handling & file I/O
+numpy
+pandas
+scipy
+h5py          # Essential: UCI/Queensland sets are often distributed as MATLAB .mat / HDF5 files
+
+# Bio-signal processing & PhysioNet tools
+wfdb          # PhysioNet Waveform Database reader
+neurokit2     # State-of-the-art bio-signal library (handles PPG peak detection, PRV, and HRV metrics)
+
+# Machine Learning & Deep Learning
+torch
+torchvision
+torchaudio
+scikit-learn
+
+# Visualization
+matplotlib
+seaborn
+
+# Development & Notebook prototyping
+jupyterlab
+ipywidgets
