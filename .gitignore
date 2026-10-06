@@ -1,5 +1,5 @@
-# Datasets (root dataset folder)
-/data/
+# Raw datasets (ignore large raw datasets)
+/data/raw/
 
 # Python virtual environment
 venv/

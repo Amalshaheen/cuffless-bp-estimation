@@ -159,6 +159,7 @@ def process_window(
 def process_uci_mimic(
     mat_path: str = "data/raw/uci_mimic/Part_1.mat",
     max_records: Optional[int] = None,
+    target_valid: Optional[int] = None,
     window_seconds: int = 120,
     stride_seconds: Optional[int] = None,
     sampling_rate: int = 125,
@@ -195,15 +196,21 @@ def process_uci_mimic(
         num_cells = min(total_cells, max_records) if max_records else total_cells
 
         logger.info(
-            "Found %d records in %s. Processing %d records (window=%ds, stride=%ds).",
+            "Found %d records in %s. Target valid subjects: %s (window=%ds).",
             total_cells,
             main_key,
-            num_cells,
+            str(target_valid) if target_valid else "all",
             window_seconds,
-            stride_seconds or window_seconds,
         )
 
         for cell_idx in range(num_cells):
+            if target_valid is not None and len(records) >= target_valid:
+                logger.info(
+                    "Target valid count of %d reached. Stopping extraction immediately.",
+                    target_valid,
+                )
+                break
+
             try:
                 ref = dataset[cell_idx, 0]
                 sample_data = np.array(f[ref])
@@ -228,8 +235,9 @@ def process_uci_mimic(
             if total_samples < window_samples:
                 continue
 
-            # Sliding windows over the record
-            win_count = 0
+            # Try candidate segments in this record.
+            # As soon as 1 valid segment is obtained, save it and advance to the next record
+            # (1 segment per subject to ensure strict subject isolation).
             for start_idx in range(0, total_samples - window_samples + 1, stride_samples):
                 end_idx = start_idx + window_samples
                 ppg_win = ppg_all[start_idx:end_idx]
@@ -239,7 +247,7 @@ def process_uci_mimic(
                 if not (np.isfinite(mean_sbp) and np.isfinite(mean_dbp)):
                     continue
 
-                rec_id = f"uci_cell{cell_idx:04d}_win{win_count:02d}"
+                rec_id = f"uci_cell{cell_idx:04d}_win00"
                 row = process_window(
                     ppg_win,
                     target_sbp=mean_sbp,
@@ -249,15 +257,16 @@ def process_uci_mimic(
                 )
                 if row is not None:
                     records.append(row)
-                    win_count += 1
-
-            if (cell_idx + 1) % 10 == 0 or cell_idx == num_cells - 1:
-                logger.info(
-                    "Processed %d/%d records | Current valid feature rows: %d",
-                    cell_idx + 1,
-                    num_cells,
-                    len(records),
-                )
+                    if len(records) % 25 == 0 or len(records) == target_valid:
+                        logger.info(
+                            "Progress: %d/%s valid subjects extracted (latest: cell %d, SBP=%.1f, DBP=%.1f)",
+                            len(records),
+                            str(target_valid) if target_valid else "?",
+                            cell_idx,
+                            mean_sbp,
+                            mean_dbp,
+                        )
+                    break  # Exactly 1 segment per subject
 
     df = pd.DataFrame(records, columns=FEATURE_COLUMNS)
     logger.info("UCI extraction complete. Total valid samples: %d", len(df))
@@ -372,8 +381,9 @@ def process_uq_dataset(
 def build_dataset(
     dataset_type: str = "uci",
     raw_data_path: Optional[str] = None,
-    output_path: str = "data/processed/feature_matrix.csv",
+    output_path: Optional[str] = None,
     max_records: Optional[int] = None,
+    target_valid: Optional[int] = None,
     window_seconds: int = 120,
     stride_seconds: Optional[int] = None,
 ) -> pd.DataFrame:
@@ -386,10 +396,14 @@ def build_dataset(
         'uci' for UCI MIMIC-II or 'uq' for University of Queensland dataset.
     raw_data_path : str, optional
         Path to file/directory. If None, uses default path for the chosen type.
-    output_path : str
+    output_path : str, optional
         Destination CSV file path for the processed feature matrix.
+        Defaults to data/processed/cohort_{target_valid}.csv if target_valid is given,
+        or data/processed/feature_matrix.csv.
     max_records : int, optional
-        Maximum number of raw records/cases to process (for batch dry runs).
+        Maximum number of raw records/cases to process.
+    target_valid : int, optional
+        Target number of valid records before halting extraction.
     window_seconds : int
         Window duration in seconds (recommended >= 120s to ensure PRV validity).
     stride_seconds : int, optional
@@ -400,6 +414,12 @@ def build_dataset(
     pd.DataFrame
         Constructed feature matrix DataFrame.
     """
+    if not output_path:
+        if target_valid is not None:
+            output_path = f"data/processed/cohort_{target_valid}.csv"
+        else:
+            output_path = "data/processed/feature_matrix.csv"
+
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     if dataset_type.lower() == "uci":
@@ -407,6 +427,7 @@ def build_dataset(
         df = process_uci_mimic(
             mat_path=path,
             max_records=max_records,
+            target_valid=target_valid,
             window_seconds=window_seconds,
             stride_seconds=stride_seconds,
             sampling_rate=125,
@@ -450,14 +471,20 @@ def main():
     parser.add_argument(
         "--output-path",
         type=str,
-        default="data/processed/feature_matrix.csv",
-        help="Output CSV path.",
+        default=None,
+        help="Output CSV path (default: data/processed/cohort_{target_valid}.csv or feature_matrix.csv).",
     )
     parser.add_argument(
         "--max-records",
         type=int,
         default=None,
-        help="Max records to process (for quick testing).",
+        help="Max records to scan (optional cap).",
+    )
+    parser.add_argument(
+        "--target-valid",
+        type=int,
+        default=225,
+        help="Target count of valid subjects to extract before terminating (default: 225).",
     )
     parser.add_argument(
         "--window-sec",
@@ -478,6 +505,7 @@ def main():
         raw_data_path=args.raw_path,
         output_path=args.output_path,
         max_records=args.max_records,
+        target_valid=args.target_valid,
         window_seconds=args.window_sec,
         stride_seconds=args.stride_sec,
     )
