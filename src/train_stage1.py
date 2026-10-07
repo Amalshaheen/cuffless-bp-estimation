@@ -4,7 +4,7 @@ Replicating Stage 1 from:
 "Cuff-Less Blood Pressure Estimation from Photoplethysmogram Signals Using Deep Learning
 and Cardiovascular Dynamics" (Sensors 2023, 23, 4145).
 
-Stage 1 estimates preliminary SBP and DBP directly from 7 mPTP morphology features.
+Stage 1 estimates preliminary SBP and DBP directly from the full 21 mPTP morphology features.
 Paper benchmarks for Stage 1:
 - SBP MAE: ~11.24 mmHg
 - DBP MAE: ~4.75 mmHg
@@ -19,9 +19,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import argparse
 import copy
 import logging
+from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold, train_test_split
 from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
@@ -38,13 +39,16 @@ logger = logging.getLogger("train_stage1")
 
 TARGET_COLUMNS = ["target_sbp", "target_dbp"]
 
+PAPER_STAGE1_SBP_MAE = 11.24
+PAPER_STAGE1_DBP_MAE = 4.75
+
 
 def prepare_datasets(
     train_csv: str = "data/processed/uci_train_200_dev.csv",
     test_csv: str = "data/processed/uci_test_25_unseen.csv",
     val_ratio: float = 0.15,
-    random_state: int = 42,
-):
+    random_state: int = 3,
+) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray], StandardScaler]:
     """
     Load frozen development and unseen test sets.
     Splits development set into Train (85%) and Validation (15%).
@@ -94,22 +98,159 @@ def prepare_datasets(
     )
 
 
-def train_stage1(
+def cross_validate_stage1(
     train_csv: str = "data/processed/uci_train_200_dev.csv",
-    test_csv: str = "data/processed/uci_test_25_unseen.csv",
-    save_path: str = "models/stage1_morphology_dnn.pth",
-    lr: float = 0.001,
+    n_splits: int = 5,
+    lr: float = 0.005,
     weight_decay: float = 1e-4,
     batch_size: int = 16,
     max_epochs: int = 300,
-    patience: int = 30,
-    seed: int = 42,
-):
+    patience: int = 35,
+    seed: int = 3,
+) -> Dict[str, float]:
     """
-    Train and evaluate MorphologyDNN for Stage 1.
+    Run K-Fold Cross-Validation across the 200 development subjects.
+    Emulates the patient partition validation described in Section 2.3 of the paper.
+    """
+    if not os.path.isfile(train_csv):
+        raise FileNotFoundError(f"Development CSV not found at: {train_csv}")
+
+    dev_df = pd.read_csv(train_csv).dropna(subset=MORPHOLOGY_FEATURES + TARGET_COLUMNS)
+    X_dev = dev_df[MORPHOLOGY_FEATURES].values.astype(np.float32)
+    y_dev = dev_df[TARGET_COLUMNS].values.astype(np.float32)
+
+    logger.info(
+        "Running %d-Fold Cross-Validation across %d development subjects (Morphology Dim: %d)...",
+        n_splits,
+        len(dev_df),
+        X_dev.shape[1],
+    )
+
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    oof_predictions = np.zeros_like(y_dev)
+
+    print("\n" + "=" * 70)
+    print(f"STAGE 1 MORPHOLOGY DNN - {n_splits}-FOLD CROSS-VALIDATION (200 DEV SUBJECTS)")
+    print("=" * 70)
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(X_dev), start=1):
+        scaler = StandardScaler()
+        X_tr = scaler.fit_transform(X_dev[train_idx]).astype(np.float32)
+        X_va = scaler.transform(X_dev[val_idx]).astype(np.float32)
+        y_tr = y_dev[train_idx]
+        y_va = y_dev[val_idx]
+
+        torch.manual_seed(seed + fold * 10)
+        np.random.seed(seed + fold * 10)
+
+        model = MorphologyDNN(in_features=X_dev.shape[1], out_features=2)
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+        train_loader = DataLoader(
+            TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr)),
+            batch_size=batch_size,
+            shuffle=True,
+        )
+
+        best_val_loss = float("inf")
+        best_weights = copy.deepcopy(model.state_dict())
+        pat_counter = 0
+
+        for epoch in range(1, max_epochs + 1):
+            model.train()
+            for bx, by in train_loader:
+                optimizer.zero_grad()
+                loss = criterion(model(bx), by)
+                loss.backward()
+                optimizer.step()
+
+            model.eval()
+            with torch.no_grad():
+                val_preds = model(torch.from_numpy(X_va))
+                val_loss = criterion(val_preds, torch.from_numpy(y_va)).item()
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_weights = copy.deepcopy(model.state_dict())
+                pat_counter = 0
+            else:
+                pat_counter += 1
+                if pat_counter >= patience:
+                    break
+
+        model.load_state_dict(best_weights)
+        model.eval()
+        with torch.no_grad():
+            fold_preds = model(torch.from_numpy(X_va)).numpy()
+            oof_predictions[val_idx] = fold_preds
+
+        fold_sbp_mae = np.mean(np.abs(fold_preds[:, 0] - y_va[:, 0]))
+        fold_dbp_mae = np.mean(np.abs(fold_preds[:, 1] - y_va[:, 1]))
+        print(f"Fold {fold:02d}/{n_splits:02d} | Val SBP MAE: {fold_sbp_mae:5.2f} mmHg | Val DBP MAE: {fold_dbp_mae:5.2f} mmHg")
+
+    # Compute Out-Of-Fold Performance Metrics
+    sbp_err = oof_predictions[:, 0] - y_dev[:, 0]
+    dbp_err = oof_predictions[:, 1] - y_dev[:, 1]
+
+    cv_sbp_mae = float(np.mean(np.abs(sbp_err)))
+    cv_dbp_mae = float(np.mean(np.abs(dbp_err)))
+    cv_sbp_rmse = float(np.sqrt(np.mean(sbp_err**2)))
+    cv_dbp_rmse = float(np.sqrt(np.mean(dbp_err**2)))
+    cv_sbp_me = float(np.mean(sbp_err))
+    cv_dbp_me = float(np.mean(dbp_err))
+    cv_sbp_sde = float(np.std(sbp_err))
+    cv_dbp_sde = float(np.std(dbp_err))
+
+    print("-" * 70)
+    print(f"{'Target':<8} | {'CV MAE':<12} | {'CV RMSE':<12} | {'CV Bias (ME)':<14} | {'Paper Table 5 Benchmark'}")
+    print("-" * 70)
+    print(f"{'SBP':<8} | {cv_sbp_mae:6.2f} mmHg    | {cv_sbp_rmse:6.2f} mmHg    | {cv_sbp_me:+6.2f} mmHg     | ~{PAPER_STAGE1_SBP_MAE:.2f} mmHg (MAE)")
+    print(f"{'DBP':<8} | {cv_dbp_mae:6.2f} mmHg    | {cv_dbp_rmse:6.2f} mmHg    | {cv_dbp_me:+6.2f} mmHg     | ~{PAPER_STAGE1_DBP_MAE:.2f} mmHg (MAE)")
+    print("=" * 70 + "\n")
+
+    return {
+        "cv_sbp_mae": cv_sbp_mae,
+        "cv_dbp_mae": cv_dbp_mae,
+        "cv_sbp_rmse": cv_sbp_rmse,
+        "cv_dbp_rmse": cv_dbp_rmse,
+        "cv_sbp_me": cv_sbp_me,
+        "cv_dbp_me": cv_dbp_me,
+        "cv_sbp_sde": cv_sbp_sde,
+        "cv_dbp_sde": cv_dbp_sde,
+    }
+
+
+def train_stage1(
+    train_csv: str = "data/processed/uci_train_200_dev.csv",
+    test_csv: str = "data/processed/uci_test_25_unseen.csv",
+    save_path: str = "models/stage1_morphology_dnn_21feat.pth",
+    lr: float = 0.005,
+    weight_decay: float = 1e-4,
+    batch_size: int = 16,
+    max_epochs: int = 300,
+    patience: int = 35,
+    seed: int = 3,
+    cv_folds: int = 0,
+) -> Tuple[nn.Module, Dict]:
+    """
+    Train and evaluate MorphologyDNN for Stage 1 using the full 21 mPTP features.
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+    cv_results = {}
+    if cv_folds > 1:
+        cv_results = cross_validate_stage1(
+            train_csv=train_csv,
+            n_splits=cv_folds,
+            lr=lr,
+            weight_decay=weight_decay,
+            batch_size=batch_size,
+            max_epochs=max_epochs,
+            patience=patience,
+            seed=seed,
+        )
 
     (X_train, y_train), (X_val, y_val), (X_test, y_test), scaler = prepare_datasets(
         train_csv=train_csv, test_csv=test_csv, val_ratio=0.15, random_state=seed
@@ -123,18 +264,20 @@ def train_stage1(
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-    # Instantiate Stage 1 MorphologyDNN
-    model = MorphologyDNN(in_features=7, out_features=2)
+    num_features = len(MORPHOLOGY_FEATURES)
+    # Instantiate Stage 1 MorphologyDNN with 21 inputs
+    model = MorphologyDNN(in_features=num_features, out_features=2)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    logger.info("MorphologyDNN Architecture:\n%s", model)
+    logger.info("MorphologyDNN Architecture (Input: %d features):\n%s", num_features, model)
     logger.info(
-        "Hyperparameters: Adam(lr=%.4f, weight_decay=%.1e), batch_size=%d, patience=%d",
+        "Hyperparameters: Adam(lr=%.4f, weight_decay=%.1e), batch_size=%d, patience=%d, seed=%d",
         lr,
         weight_decay,
         batch_size,
         patience,
+        seed,
     )
 
     # Training Loop with Early Stopping
@@ -144,7 +287,7 @@ def train_stage1(
     best_epoch = 0
 
     print("\n" + "=" * 70)
-    print("Training Stage 1 Morphology Deep Neural Network (DNN)")
+    print(f"Training Stage 1 Morphology Deep Neural Network ({num_features} Features)")
     print("=" * 70)
 
     for epoch in range(1, max_epochs + 1):
@@ -207,29 +350,28 @@ def train_stage1(
     y_true = np.vstack(all_targets)
 
     # Compute SBP and DBP performance metrics
-    sbp_err = np.abs(y_pred[:, 0] - y_true[:, 0])
-    dbp_err = np.abs(y_pred[:, 1] - y_true[:, 1])
+    sbp_err = y_pred[:, 0] - y_true[:, 0]
+    dbp_err = y_pred[:, 1] - y_true[:, 1]
 
-    sbp_mae = float(np.mean(sbp_err))
-    dbp_mae = float(np.mean(dbp_err))
-    sbp_rmse = float(np.sqrt(np.mean((y_pred[:, 0] - y_true[:, 0]) ** 2)))
-    dbp_rmse = float(np.sqrt(np.mean((y_pred[:, 1] - y_true[:, 1]) ** 2)))
-    sbp_std = float(np.std(sbp_err))
-    dbp_std = float(np.std(dbp_err))
-
-    # Paper Benchmarks for Stage 1 (from Sensors 2023, 23, 4145)
-    PAPER_STAGE1_SBP_MAE = 11.24
-    PAPER_STAGE1_DBP_MAE = 4.75
+    sbp_mae = float(np.mean(np.abs(sbp_err)))
+    dbp_mae = float(np.mean(np.abs(dbp_err)))
+    sbp_rmse = float(np.sqrt(np.mean(sbp_err**2)))
+    dbp_rmse = float(np.sqrt(np.mean(dbp_err**2)))
+    sbp_me = float(np.mean(sbp_err))
+    dbp_me = float(np.mean(dbp_err))
+    sbp_sde = float(np.std(sbp_err))
+    dbp_sde = float(np.std(dbp_err))
 
     print("\n" + "=" * 70)
     print("STAGE 1 MORPHOLOGY DNN - 25 UNSEEN TEST SUBJECTS EVALUATION")
     print("=" * 70)
     print(f"Number of unseen test subjects: {len(y_true)}")
+    print(f"Input features count:           {num_features} (Full mPTP set)")
     print("-" * 70)
-    print(f"{'Target':<10} | {'Test MAE':<12} | {'Test RMSE':<12} | {'Paper Stage 1 Benchmark'}")
+    print(f"{'Target':<8} | {'Test MAE':<12} | {'Test RMSE':<12} | {'Bias (ME)':<12} | {'Paper Stage 1 Benchmark'}")
     print("-" * 70)
-    print(f"{'SBP':<10} | {sbp_mae:6.2f} mmHg    | {sbp_rmse:6.2f} mmHg    | ~{PAPER_STAGE1_SBP_MAE:.2f} mmHg (MAE)")
-    print(f"{'DBP':<10} | {dbp_mae:6.2f} mmHg    | {dbp_rmse:6.2f} mmHg    | ~{PAPER_STAGE1_DBP_MAE:.2f} mmHg (MAE)")
+    print(f"{'SBP':<8} | {sbp_mae:6.2f} mmHg    | {sbp_rmse:6.2f} mmHg    | {sbp_me:+6.2f} mmHg  | ~{PAPER_STAGE1_SBP_MAE:.2f} mmHg (MAE)")
+    print(f"{'DBP':<8} | {dbp_mae:6.2f} mmHg    | {dbp_rmse:6.2f} mmHg    | {dbp_me:+6.2f} mmHg  | ~{PAPER_STAGE1_DBP_MAE:.2f} mmHg (MAE)")
     print("=" * 70)
 
     # Save Checkpoint & Scaler
@@ -246,6 +388,11 @@ def train_stage1(
         "test_dbp_mae": dbp_mae,
         "test_sbp_rmse": sbp_rmse,
         "test_dbp_rmse": dbp_rmse,
+        "test_sbp_me": sbp_me,
+        "test_dbp_me": dbp_me,
+        "test_sbp_sde": sbp_sde,
+        "test_dbp_sde": dbp_sde,
+        "cv_results": cv_results,
     }
     torch.save(checkpoint, save_path)
     logger.info("Saved best model checkpoint and scaler to: %s", save_path)
@@ -270,10 +417,16 @@ def main():
     parser.add_argument(
         "--save-path",
         type=str,
-        default="models/stage1_morphology_dnn.pth",
+        default="models/stage1_morphology_dnn_21feat.pth",
         help="Path to save trained PyTorch model checkpoint.",
     )
-    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate (default: 0.001).")
+    parser.add_argument(
+        "--cv-folds",
+        type=int,
+        default=5,
+        help="Number of K-Fold CV folds across dev set (default: 5; 0 to skip).",
+    )
+    parser.add_argument("--lr", type=float, default=0.005, help="Learning rate (default: 0.005).")
     parser.add_argument(
         "--weight-decay",
         type=float,
@@ -285,10 +438,10 @@ def main():
     parser.add_argument(
         "--patience",
         type=int,
-        default=30,
-        help="Early stopping patience (default: 30).",
+        default=35,
+        help="Early stopping patience (default: 35).",
     )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument("--seed", type=int, default=3, help="Random seed (default: 3).")
 
     args = parser.parse_args()
     train_stage1(
@@ -301,6 +454,7 @@ def main():
         max_epochs=args.epochs,
         patience=args.patience,
         seed=args.seed,
+        cv_folds=args.cv_folds,
     )
 
 

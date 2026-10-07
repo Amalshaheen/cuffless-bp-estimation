@@ -160,7 +160,7 @@ def process_uci_mimic(
     mat_path: str = "data/raw/uci_mimic/Part_1.mat",
     max_records: Optional[int] = None,
     target_valid: Optional[int] = None,
-    window_seconds: int = 120,
+    window_seconds: int = 480,
     stride_seconds: Optional[int] = None,
     sampling_rate: int = 125,
 ) -> pd.DataFrame:
@@ -384,7 +384,7 @@ def build_dataset(
     output_path: Optional[str] = None,
     max_records: Optional[int] = None,
     target_valid: Optional[int] = None,
-    window_seconds: int = 120,
+    window_seconds: int = 480,
     stride_seconds: Optional[int] = None,
 ) -> pd.DataFrame:
     """
@@ -405,7 +405,7 @@ def build_dataset(
     target_valid : int, optional
         Target number of valid records before halting extraction.
     window_seconds : int
-        Window duration in seconds (recommended >= 120s to ensure PRV validity).
+        Window duration in seconds (480s / 8 min per paper).
     stride_seconds : int, optional
         Step between consecutive windows. Defaults to window_seconds (non-overlapping).
 
@@ -489,8 +489,8 @@ def main():
     parser.add_argument(
         "--window-sec",
         type=int,
-        default=120,
-        help="Window duration in seconds (default: 120s).",
+        default=480,
+        help="Window duration in seconds (default: 480s).",
     )
     parser.add_argument(
         "--stride-sec",

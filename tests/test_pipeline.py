@@ -82,7 +82,7 @@ class TestFeatureExtractors(unittest.TestCase):
 class TestPyTorchModels(unittest.TestCase):
     def setUp(self):
         self.batch_size = 8
-        self.morph_x = torch.randn(self.batch_size, 7)
+        self.morph_x = torch.randn(self.batch_size, 21)
         self.dyn_x = torch.randn(self.batch_size, 7)
 
     def test_morphology_dnn(self):

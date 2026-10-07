@@ -5,8 +5,8 @@ Replicating the multi-stage neural network architecture from:
 and Cardiovascular Dynamics" (Sensors 2023, 23, 4145).
 
 Stage 1: MorphologyDNN
-    - Input: 7 mPTP morphology features
-    - Architecture: 7 -> 70 -> 100 -> 150 -> 2
+    - Input: 21 mPTP morphology features
+    - Architecture: 21 -> 70 -> 100 -> 150 -> 2
     - Activation: Sigmoid for hidden layers, Linear for output
     - Output: Preliminary SBP and DBP estimates
 
@@ -32,14 +32,14 @@ class MorphologyDNN(nn.Module):
     """
     Stage 1: Morphology-based preliminary BP estimation network.
 
-    Takes 7 mPTP pulse morphology features and outputs preliminary
+    Takes 21 mPTP pulse morphology features and outputs preliminary
     estimates for both Systolic Blood Pressure (SBP) and Diastolic Blood Pressure (DBP).
 
     Architecture:
-        Input (7) -> Linear(70) + Sigmoid -> Linear(100) + Sigmoid -> Linear(150) + Sigmoid -> Linear(2)
+        Input (21) -> Linear(70) + Sigmoid -> Linear(100) + Sigmoid -> Linear(150) + Sigmoid -> Linear(2)
     """
 
-    def __init__(self, in_features: int = 7, out_features: int = 2):
+    def __init__(self, in_features: int = 21, out_features: int = 2):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_features, 70),
@@ -58,7 +58,7 @@ class MorphologyDNN(nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            Batch of morphology features of shape (batch_size, 7).
+            Batch of morphology features of shape (batch_size, 21).
 
         Returns
         -------
@@ -152,7 +152,7 @@ class CascadedBPENet(nn.Module):
 
     def __init__(
         self,
-        morphology_dim: int = 7,
+        morphology_dim: int = 21,
         dynamics_dim: int = 7,
     ):
         super().__init__()
@@ -171,7 +171,7 @@ class CascadedBPENet(nn.Module):
         Parameters
         ----------
         morphology_features : torch.Tensor
-            Tensor of shape (batch_size, 7) containing mPTP morphology features.
+            Tensor of shape (batch_size, 21) containing mPTP morphology features.
         dynamics_features : torch.Tensor
             Tensor of shape (batch_size, 7) containing PRV dynamics features.
 

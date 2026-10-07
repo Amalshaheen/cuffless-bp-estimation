@@ -18,15 +18,33 @@ import neurokit2 as nk
 
 logger = logging.getLogger(__name__)
 
-# Feature column definitions as per the paper
+# Feature column definitions as per the paper (Sensors 2023, 23, 4145)
 MORPHOLOGY_FEATURES: List[str] = [
+    # 3 Timings
     "cardiac_period",
+    "systolic_upstroke_time",
     "diastolic_time",
+    # 6 Diastolic Widths
+    "dias_w_10",
     "dias_w_25",
+    "dias_w_33",
+    "dias_w_50",
+    "dias_w_66",
     "dias_w_75",
+    # 6 Sum Widths
+    "sum_w_10",
+    "sum_w_25",
     "sum_w_33",
+    "sum_w_50",
+    "sum_w_66",
     "sum_w_75",
+    # 6 Ratios
     "ratio_10",
+    "ratio_25",
+    "ratio_33",
+    "ratio_50",
+    "ratio_66",
+    "ratio_75",
 ]
 
 DYNAMICS_FEATURES: List[str] = [
@@ -147,22 +165,32 @@ def extract_mptp_morphology(
     troughs: np.ndarray
 ) -> pd.Series:
     """
-    Extract 7 pulse morphology indicators using the mean Point-to-Point (mPTP) algorithm.
+    Extract the full 21 pulse morphology indicators using the mean Point-to-Point (mPTP) algorithm.
+    Based on Section 2.2.1 of Sensors 2023, 23, 4145.
 
     For each valid cardiac cycle delimited by consecutive troughs (troughs[i] to troughs[i+1])
     with exactly one intermediate systolic peak:
-    1. cardiac_period: Total pulse duration (samples)
-    2. diastolic_time: Duration from systolic peak to pulse end trough (samples)
-    3. dias_w_25: Width from peak to downstroke crossing at 25% pulse height (samples)
-    4. dias_w_75: Width from peak to downstroke crossing at 75% pulse height (samples)
-    5. sum_w_33: Total pulse width at 33% pulse height (samples)
-    6. sum_w_75: Total pulse width at 75% pulse height (samples)
-    7. ratio_10: Ratio of diastolic width at 10% to systolic width at 10%
+    - 3 Timings:
+        1. cardiac_period: Total pulse duration (samples)
+        2. systolic_upstroke_time: Duration from pulse start trough to systolic peak (samples)
+        3. diastolic_time: Duration from systolic peak to pulse end trough (samples)
+    - 6 Diastolic Widths:
+        4-9. dias_w_10, dias_w_25, dias_w_33, dias_w_50, dias_w_66, dias_w_75:
+             Width from systolic peak to downstroke crossing at 10%, 25%, 33%, 50%, 66%, 75%
+             of peak amplitude (samples)
+    - 6 Sum Widths:
+        10-15. sum_w_10, sum_w_25, sum_w_33, sum_w_50, sum_w_66, sum_w_75:
+               Total pulse width (systolic + diastolic) at 10%, 25%, 33%, 50%, 66%, 75%
+               of peak amplitude (samples)
+    - 6 Ratios:
+        16-21. ratio_10, ratio_25, ratio_33, ratio_50, ratio_66, ratio_75:
+               Ratio of diastolic width to systolic width at 10%, 25%, 33%, 50%, 66%, 75%
+               of peak amplitude
 
     Parameters
     ----------
     cleaned_signal : np.ndarray
-        1D array of the preprocessed PPG signal.
+        1D array of the preprocessed PPG signal (e.g., 480-second window).
     peaks : np.ndarray
         1D array of sample indices for detected systolic peaks.
     troughs : np.ndarray
@@ -186,6 +214,23 @@ def extract_mptp_morphology(
         )
 
     morphology_records: List[List[float]] = []
+
+    # Threshold percentages for widths and ratios
+    threshold_specs = [
+        ("10", 0.10),
+        ("25", 0.25),
+        ("33", 0.33),
+        ("50", 0.50),
+        ("66", 0.66),
+        ("75", 0.75),
+    ]
+
+    def _find_crossings(sig: np.ndarray, p_idx: int, level: float):
+        up = np.where(sig[:p_idx] <= level)[0]
+        down = np.where(sig[p_idx:] <= level)[0]
+        up_idx = int(up[-1]) if len(up) > 0 else 0
+        down_idx = int(p_idx + down[0]) if len(down) > 0 else len(sig) - 1
+        return up_idx, down_idx
 
     # Iterate through consecutive troughs defining pulse boundaries
     for i in range(len(troughs) - 1):
@@ -213,45 +258,38 @@ def extract_mptp_morphology(
         if amp <= 1e-6:
             continue
 
-        # Amplitude percentage threshold heights
-        h10 = y_min + 0.10 * amp
-        h25 = y_min + 0.25 * amp
-        h33 = y_min + 0.33 * amp
-        h75 = y_min + 0.75 * amp
-
-        def _find_crossings(sig: np.ndarray, p_idx: int, level: float):
-            up = np.where(sig[:p_idx] <= level)[0]
-            down = np.where(sig[p_idx:] <= level)[0]
-            up_idx = int(up[-1]) if len(up) > 0 else 0
-            down_idx = int(p_idx + down[0]) if len(down) > 0 else len(sig) - 1
-            return up_idx, down_idx
-
-        u10, d10 = _find_crossings(segment, local_p, h10)
-        u25, d25 = _find_crossings(segment, local_p, h25)
-        u33, d33 = _find_crossings(segment, local_p, h33)
-        u75, d75 = _find_crossings(segment, local_p, h75)
-
-        # 7 morphology indicators in sample counts
+        # 3 Timings (in sample counts)
         cardiac_period = float(len(segment))
+        systolic_upstroke_time = float(local_p)
         diastolic_time = float(len(segment) - local_p)
-        dias_w_25 = float(d25 - local_p)
-        dias_w_75 = float(d75 - local_p)
-        sum_w_33 = float(d33 - u33)
-        sum_w_75 = float(d75 - u75)
 
-        sys_w_10 = max(float(local_p - u10), 1.0)
-        dias_w_10 = max(float(d10 - local_p), 1.0)
-        ratio_10 = float(dias_w_10 / sys_w_10)
+        dias_widths: List[float] = []
+        sum_widths: List[float] = []
+        ratios: List[float] = []
 
-        morphology_records.append([
+        for _, pct in threshold_specs:
+            h = y_min + pct * amp
+            u, d = _find_crossings(segment, local_p, h)
+            dias_w = float(d - local_p)
+            sum_w = float(d - u)
+            sys_w = max(float(local_p - u), 1.0)
+            dias_w_pos = max(dias_w, 1.0)
+            ratio = float(dias_w_pos / sys_w)
+
+            dias_widths.append(dias_w)
+            sum_widths.append(sum_w)
+            ratios.append(ratio)
+
+        # Assemble the full 21 indicators for this cardiac cycle
+        cycle_features = [
             cardiac_period,
+            systolic_upstroke_time,
             diastolic_time,
-            dias_w_25,
-            dias_w_75,
-            sum_w_33,
-            sum_w_75,
-            ratio_10,
-        ])
+            *dias_widths,
+            *sum_widths,
+            *ratios,
+        ]
+        morphology_records.append(cycle_features)
 
     if not morphology_records:
         logger.warning("No valid pulse cycles met criteria for mPTP morphology extraction.")
@@ -266,7 +304,7 @@ def extract_mptp_morphology(
     mptp_mean = np.mean(morph_arr, axis=0)
 
     logger.debug(
-        "Extracted mPTP morphology across %d valid cardiac cycles.",
+        "Extracted full 21 mPTP morphology features across %d valid cardiac cycles.",
         len(morphology_records),
     )
 
